@@ -1,0 +1,350 @@
+import tkinter as tk
+import tkinter.messagebox as mb
+from tkinter import ttk, messagebox
+from threading import Thread, Event
+import time
+import random
+from collections import defaultdict
+
+
+class Computer:
+    def __init__(self, cpu, ram, disk, failure_prob):
+        self.cpu = cpu
+        self.ram = ram
+        self.disk = disk
+        self.failure_prob = failure_prob
+        self.working = True
+
+    def check_failure(self):
+        if random.random() < self.failure_prob:
+            self.working = False
+        return self.working
+
+    def repair(self):
+        time.sleep(10)
+        self.working = True
+
+
+class Workstation(Computer):
+    def __init__(self, cpu, ram, disk, failure_prob, max_resolution, computer_class):
+        super().__init__(cpu, ram, disk, failure_prob)
+        self.max_resolution = max_resolution
+        self.computer_class = computer_class
+
+
+class Server(Computer):
+    def __init__(self, cpu, ram, disk, failure_prob, db_support=False, gis_support=False, backup_support=False):
+        super().__init__(cpu, ram, disk, failure_prob)
+        self.db_support = db_support
+        self.gis_support = gis_support
+        self.backup_support = backup_support
+
+
+class User:
+    def __init__(self, username, password, max_resolution=None, db_needed=False, gis_needed=False):
+        self.username = username
+        self.password = password
+        self.max_resolution = max_resolution
+        self.db_needed = db_needed
+        self.gis_needed = gis_needed
+        self.time_spent = 0
+        self.waiting_time = 0
+        self.attempts = 0
+        self.in_network = False
+        self.current_class = None
+
+
+class ComputerClass:
+    def __init__(self, name):
+        self.name = name
+        self.workstations = []
+        self.servers = []
+
+    def add_workstation(self, workstation):
+        self.workstations.append(workstation)
+
+    def add_server(self, server):
+        self.servers.append(server)
+
+    def is_operational(self):
+        if not any(server.working for server in self.servers):
+            raise RuntimeError("Сервера не отвечают, вызовите мастера")
+        return True
+
+    def get_free_workstation(self, user):
+        for workstation in self.workstations:
+            if workstation.working and (
+                    user.max_resolution is None or workstation.max_resolution == user.max_resolution):
+                return workstation
+        return None
+
+
+class ComputerLab:
+    def __init__(self):
+        self.classes = {}
+        self.users = []
+        self.waiting_users = []
+        self.stats = defaultdict(int)
+        self.user_stats = defaultdict(list)
+        self.stop_event = Event()
+        self.repairing_classes = set()
+        self.repairing_workstations = set()
+
+    def add_class(self, computer_class):
+        self.classes[computer_class.name] = computer_class
+
+    def add_user(self, user):
+        self.users.append(user)
+
+    def simulate_step(self):
+        if self.stop_event.is_set():
+            return
+
+        # Проверка на сбои и запуск ремонта
+        for comp_class in self.classes.values():
+            for comp in comp_class.workstations + comp_class.servers:
+                if not comp.check_failure():
+                    if isinstance(comp, Workstation) and comp not in self.repairing_workstations:
+                        self.repair_workstation(comp)
+                    elif isinstance(comp, Server) and comp_class.name not in self.repairing_classes:
+                        self.repairing_classes.add(comp_class.name)
+                        self.start_repairing_server(comp_class)
+
+        # Обработка пользователей
+        users_to_remove = []
+        for user in self.users:
+            if not user.in_network:
+                user.attempts += 1
+                user.waiting_time += 1
+                for comp_class in self.classes.values():
+                    try:
+                        if not comp_class.is_operational():
+                            continue
+                    except RuntimeError:
+                        continue
+
+                    ws = comp_class.get_free_workstation(user)
+                    if ws:
+                        user.in_network = True
+                        user.current_class = comp_class.name
+                        user.time_spent += 1
+                        break
+                else:
+                    if user.attempts >= 3:
+                        self.user_stats['failed_attempts'].append(user)
+                        users_to_remove.append(user)
+            else:
+                user.time_spent += 1
+                if random.random() < 0.05:  # Пользователь случайным образом завершает работу
+                    user.in_network = False
+                    self.user_stats['successful_users'].append(user)
+                    users_to_remove.append(user)
+
+        for user in users_to_remove:
+            self.users.remove(user)
+            if user in self.waiting_users:
+                self.waiting_users.remove(user)
+
+        # Перемещение пользователей из ожидания в активные
+        while self.waiting_users and any(comp_class.get_free_workstation(self.waiting_users[0]) for comp_class in self.classes.values()):
+            user = self.waiting_users.pop(0)
+            self.users.append(user)
+
+        # Добавление новых пользователей случайным образом
+        if random.random() < 0.7:
+            new_user = User(f"user{len(self.users) + len(self.waiting_users) + len(self.user_stats['successful_users']) + len(self.user_stats['failed_attempts'])}", "password")
+            self.waiting_users.append(new_user)
+
+        # Сбор статистики
+        self.collect_stats()
+
+    def repair_workstation(self, workstation):
+        def repair():
+            self.repairing_workstations.add(workstation)
+            workstation.repair()
+            self.repairing_workstations.remove(workstation)
+            self.collect_stats()
+
+        repair_thread = Thread(target=repair)
+        repair_thread.start()
+
+    def collect_stats(self):
+        for class_name, comp_class in self.classes.items():
+                self.stats[(class_name, 'Всего компьютеров')] = len(comp_class.workstations)
+                self.stats[(class_name, 'Работоспособных компьютеров')] = sum(1 for ws in comp_class.workstations if ws.working)
+                self.stats[(class_name, 'Всего серверов')] = len(comp_class.servers)
+                self.stats[(class_name, 'Работоспособных серверов')] = sum(1 for srv in comp_class.servers if srv.working)
+                self.stats[(class_name, 'Серверов с БД')] = sum(
+                    1 for srv in comp_class.servers if srv.db_support and srv.working)
+                self.stats[(class_name, 'Серверов с ГИС')] = sum(
+                    1 for srv in comp_class.servers if srv.gis_support and srv.working)
+                self.stats[(class_name, 'Серверов с Бэкапами')] = sum(
+                    1 for srv in comp_class.servers if srv.backup_support and srv.working)
+                self.stats[(class_name, 'Пользователей в классе')] = sum(
+                    1 for user in self.users if user.current_class == class_name)
+        self.stats['Всего компьютеров'] = sum(len(cls.workstations) for cls in self.classes.values())
+        self.stats['Работоспособных компьютеров'] = sum(
+            1 for cls in self.classes.values() for ws in cls.workstations if ws.working)
+        self.stats['Всего серверов'] = sum(len(cls.servers) for cls in self.classes.values())
+        self.stats['Работоспособных серверов'] = sum(1 for cls in self.classes.values() for srv in cls.servers if srv.working)
+        self.stats['Серверов с БД'] = sum(
+            1 for cls in self.classes.values() for srv in cls.servers if srv.db_support and srv.working)
+        self.stats['Серверов с ГИС'] = sum(
+            1 for cls in self.classes.values() for srv in cls.servers if srv.gis_support and srv.working)
+        self.stats['Серверов с Бэкапами'] = sum(
+            1 for cls in self.classes.values() for srv in cls.servers if srv.backup_support and srv.working)
+        self.stats['Пользователей в сети'] = sum(1 for user in self.users if user.in_network)
+        self.stats['Ожидающих пользователей'] = len(self.waiting_users)
+        self.stats['Среднее время сеанса'] = sum(user.time_spent for user in self.user_stats['successful_users']) / len(self.user_stats['successful_users']) if self.user_stats['successful_users'] else 0
+        self.stats['Всего ошибок'] = sum(
+            1 for cls in self.classes.values() for comp in cls.workstations + cls.servers if not comp.working)
+        self.stats['Неисправно компьютеров'] = sum(
+            1 for cls in self.classes.values() for ws in cls.workstations if not ws.working)
+        self.stats['Неисправно серверов'] = sum(
+            1 for cls in self.classes.values() for srv in cls.servers if not srv.working)
+        self.stats['Успешных пользователей'] = len(self.user_stats['successful_users'])
+        self.stats['Неуспешных пользователей'] = len(self.user_stats['failed_attempts'])
+
+    def start_repairing_server(self, comp_class):
+        def repair():
+            for server in comp_class.servers:
+                if not server.working:
+                    server.repair()
+            self.repairing_classes.remove(comp_class.name)
+            self.collect_stats()
+
+        repair_thread = Thread(target=repair)
+        repair_thread.start()
+
+    def get_users_in_class(self, class_name):
+        return [user.username for user in self.users if user.current_class == class_name]
+
+
+class Application(tk.Tk):
+    def __init__(self, lab):
+        super().__init__()
+        self.lab = lab
+        self.title("Симуляция компьютерного класса")
+        self.running = False
+        self.create_widgets()
+
+    def create_widgets(self):
+        title_label = ttk.Label(self, text="Симуляция компьютерного класса", font=("Helvetica", 20, "bold"), background='#B5B8B1')
+        title_label.grid(row=0, column=0, columnspan=2, pady=(10, 20))
+
+        self.general_stats_label = ttk.Label(self, text="Общая статистика", background='#B5B8B1', font=(14))
+        self.general_stats_label.grid(row=1, column=0, sticky=tk.W, padx=(10, 0))
+
+        self.general_stats_text = tk.Text(self, height=15, width=60, state=tk.DISABLED)
+        self.general_stats_text.grid(row=2, column=0, columnspan=2, padx=10, pady=10)
+
+        self.class_stats_label = ttk.Label(self, text="Статистика по классам", background='#B5B8B1', font=(14))
+        self.class_stats_label.grid(row=3, column=0, sticky=tk.W, padx=(10, 0))
+
+        self.class_stats_frames = {}
+        for i, class_name in enumerate(self.lab.classes.keys(), start=4):
+            frame = ttk.LabelFrame(self, text=class_name)
+            frame.grid(row=i, column=0, columnspan=2, padx=10, pady=10, sticky=tk.W)
+            text_widget = tk.Text(frame, height=10, width=60, state=tk.DISABLED)
+            text_widget.pack(padx=10, pady=10)
+            self.class_stats_frames[class_name] = text_widget
+
+            user_button = ttk.Button(frame, text="Показать пользователей", command=lambda cn=class_name: self.show_users(cn))
+            user_button.pack(padx=10, pady=10)
+
+        self.start_button = ttk.Button(self, text="Начать симуляцию", command=self.toggle_simulation)
+        self.start_button.grid(row=i + 1, column=0, columnspan=2, pady=(10, 20))
+
+    def update_stats(self):
+        general_stats = {k: v for k, v in self.lab.stats.items() if isinstance(k, str)}
+        general_stats_text = "\n".join([f"{key}: {value}" for key, value in general_stats.items()])
+        self.general_stats_text.config(state=tk.NORMAL)
+        self.general_stats_text.delete(1.0, tk.END)
+        self.general_stats_text.insert(tk.END, general_stats_text)
+        self.general_stats_text.config(state=tk.DISABLED)
+
+
+
+        for class_name, text_widget in self.class_stats_frames.items():
+            class_stats = {k[1]: v for k, v in self.lab.stats.items() if k[0] == class_name}
+            class_stats_text = "\n".join([f"{key}: {value}" for key, value in class_stats.items()])
+            text_widget.config(state=tk.NORMAL)
+            text_widget.delete(1.0, tk.END)
+            text_widget.insert(tk.END, class_stats_text)
+            if self.lab.repairing_classes and class_name in self.lab.repairing_classes:
+                text_widget.config(bg="red")
+            else:
+                text_widget.config(bg="white")
+            text_widget.config(state=tk.DISABLED)
+
+
+        self.after(1000, self.update_stats)
+
+    def toggle_simulation(self):
+        if self.running:
+            self.stop_simulation()
+        else:
+            self.start_simulation()
+
+    def start_simulation(self):
+        self.running = True
+        self.start_button.config(text="Остановить симуляцию")
+        self.simulation_thread = Thread(target=self.run_simulation)
+        self.simulation_thread.start()
+        self.update_stats()
+
+    def stop_simulation(self):
+        self.running = False
+        self.start_button.config(text="Начать симуляцию")
+        self.lab.stop_event.set()
+        self.simulation_thread.join()
+        self.lab.stop_event.clear()
+
+    def run_simulation(self):
+        while not self.lab.stop_event.is_set():
+            self.lab.simulate_step()
+            time.sleep(2)
+
+    def show_users(self, class_name):
+        users_in_class = self.lab.get_users_in_class(class_name)
+        user_list = "\n".join(users_in_class)
+        messagebox.showinfo(f"Пользователи в {class_name}", f"Пользователи:\n{user_list}")
+
+
+# Пример использования
+lab = ComputerLab()
+
+# Добавляем классы компьютеров и пользователей (не забудьте заменить на ваши данные)
+class_407 = ComputerClass("Аудитория 407")
+for i in range(20):
+    ws = Workstation(cpu=4, ram=16, disk=256, failure_prob=random.uniform(0.001, 0.07), max_resolution=None, computer_class="Аудитория 407")
+    class_407.add_workstation(ws)
+srv_407 = Server(cpu=16, ram=32, disk=2048, failure_prob=random.uniform(0.001, 0.04), db_support=True, gis_support=True, backup_support=True)
+class_407.add_server(srv_407)
+lab.add_class(class_407)
+
+class_315 = ComputerClass("Аудитория 315")
+for i in range(15):
+    ws = Workstation(cpu=8, ram=16, disk=512, failure_prob=random.uniform(0.001, 0.1), max_resolution="1920x1080", computer_class="Аудитория 315")
+    class_315.add_workstation(ws)
+srv_315 = Server(cpu=32, ram=64, disk=5028, failure_prob=random.uniform(0.001, 0.08), db_support=False, gis_support=True, backup_support=False)
+class_315.add_server(srv_315)
+lab.add_class(class_315)
+
+for i in range(10):
+    user = User(username=f"user{i}", password="password", max_resolution="1920x1080", db_needed=False)
+    lab.add_user(user)
+
+for i in range(10):
+    user = User(username=f"user{i+10}", password="password", max_resolution=None, db_needed=True)
+    lab.add_user(user)
+
+for i in range(10):
+    user = User(username=f"user{i+20}", password="password", max_resolution="1920x1080", db_needed=True)
+    lab.add_user(user)
+
+app = Application(lab)
+app['bg'] = '#B5B8B1'
+app.geometry('550x945')
+app.resizable(width='False', height='False')
+app.mainloop()
